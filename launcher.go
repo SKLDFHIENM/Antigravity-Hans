@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"time"
 )
 
 // LaunchWithDebug 以调试模式后台启动 App
@@ -25,10 +26,18 @@ func LaunchWithDebug(appPath string, port int) error {
 	return cmd.Start()
 }
 
-// KillProcess 强制结束所有匹配的目标 App 进程
+// KillProcess 强制结束所有匹配的目标 App 进程并确保完全退出
 func KillProcess(cfg AppConfig) {
 	fmt.Printf("正在强制结束已运行的 %s 实例...\n", cfg.Name)
 	KillApp(cfg)
+	// 等待所有残留进程彻底退出，避免 SingleInstanceLock 抢占导致新实例自杀
+	for i := 0; i < 30; i++ {
+		time.Sleep(100 * time.Millisecond)
+		app := DetectApp(cfg)
+		if !app.Running {
+			break
+		}
+	}
 }
 
 // fileExists 判断文件是否存在
