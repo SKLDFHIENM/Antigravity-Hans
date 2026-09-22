@@ -180,70 +180,111 @@ func CheckPort(port int) []CDPTarget {
 	return result
 }
 
-// IsTargetInjected 检测页面当前文档是否真正已注入汉化补丁
-func IsTargetInjected(target CDPTarget) bool {
-	dialer := websocket.DefaultDialer
-	conn, _, err := dialer.Dial(target.WebSocketDebuggerURL, nil)
-	if err != nil {
-		return false
-	}
-	defer conn.Close()
-
-	conn.SetReadDeadline(time.Now().Add(1500 * time.Millisecond))
+// checkTargetInjectedOnConn 检查当前连接对应的页面文档是否已注入补丁
+func checkTargetInjectedOnConn(conn *websocket.Conn) (bool, error) {
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
 	resp, err := cdpCall(conn, "Runtime.evaluate", map[string]interface{}{
 		"expression":    "window.__antigravityZhPatchInstalled === true && window.__observedDocument === document",
 		"returnByValue": true,
 	})
 	if err != nil {
-		return false
+		return false, err
 	}
-
 	if result, ok := resp["result"].(map[string]interface{}); ok {
 		if valObj, ok := result["result"].(map[string]interface{}); ok {
 			if val, ok := valObj["value"].(bool); ok {
-				return val
+				return val, nil
 			}
 		}
 	}
-	return false
+	return false, nil
 }
 
-// InjectTarget 向目标页面注入脚本
-func InjectTarget(target CDPTarget, overlaySource string, injectedSet map[string]bool, mu *sync.Mutex) error {
+// EnsureTargetInjected 在单条 WebSocket 连接中完成检测、脚本注入与复核。
+// 避免为每次操作频繁建立/断开短连接，彻底杜绝 Windows ConnectEx 端口耗尽 (WSAEADDRINUSE 10048) 冲突。
+// 返回值：(injected bool, isPermanentErr bool, err error)
+func EnsureTargetInjected(target CDPTarget, overlaySource string) (bool, bool, error) {
+	if target.WebSocketDebuggerURL == "" {
+		return false, true, fmt.Errorf("webSocketDebuggerUrl 为空")
+	}
+
 	dialer := websocket.DefaultDialer
-	conn, _, err := dialer.Dial(target.WebSocketDebuggerURL, nil)
+	conn, resp, err := dialer.Dial(target.WebSocketDebuggerURL, nil)
 	if err != nil {
-		return fmt.Errorf("连接 WebSocket 失败: %w", err)
+		// 对端返回 404/500（如 Splash 页面关闭后 No such target id）或明确拒绝，代表目标已销毁，无需重试
+		isPermanent := false
+		if resp != nil && (resp.StatusCode == 404 || resp.StatusCode == 500) {
+			isPermanent = true
+		} else if strings.Contains(err.Error(), "refused") || strings.Contains(err.Error(), "No such target") {
+			isPermanent = true
+		}
+		return false, isPermanent, fmt.Errorf("连接 WebSocket 失败: %w", err)
 	}
 	defer conn.Close()
 
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	// 1. 在同一个连接上先复核是否已完成注入
+	injected, err := checkTargetInjectedOnConn(conn)
+	if err == nil && injected {
+		return true, false, nil
+	}
 
-	// 监听页面后续跳转刷新
+	// 2. 启用 Page 域支持
+	_, _ = cdpCall(conn, "Page.enable", nil)
+
+	// 3. 注册新文档自动注入脚本（页面内部跳转、刷新后均自动生效）
 	if _, err := cdpCall(conn, "Page.addScriptToEvaluateOnNewDocument", map[string]interface{}{
 		"source": overlaySource,
 	}); err != nil {
-		return fmt.Errorf("监听页面刷新失败: %w", err)
+		return false, false, fmt.Errorf("监听页面刷新失败: %w", err)
 	}
 
-	// 当前页面立即执行
-	resp, err := cdpCall(conn, "Runtime.evaluate", map[string]interface{}{
+	// 4. 当前页面立即执行注入
+	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+	evalResp, err := cdpCall(conn, "Runtime.evaluate", map[string]interface{}{
 		"expression":   overlaySource,
 		"awaitPromise": false,
 	})
 	if err != nil {
-		return fmt.Errorf("Runtime.evaluate 失败: %w", err)
+		return false, false, fmt.Errorf("Runtime.evaluate 失败: %w", err)
 	}
-	if err := cdpResponseError(resp, "Runtime.evaluate"); err != nil {
-		return err
+	if err := cdpResponseError(evalResp, "Runtime.evaluate"); err != nil {
+		return false, false, err
 	}
 
-	if target.ID != "" && mu != nil {
+	// 5. 在同一连接上直接复核安装状态
+	verified, _ := checkTargetInjectedOnConn(conn)
+	if !verified {
+		return false, false, fmt.Errorf("注入后页面未确认汉化脚本已安装")
+	}
+
+	return true, false, nil
+}
+
+// IsTargetInjected 检测页面当前文档是否真正已注入汉化补丁
+func IsTargetInjected(target CDPTarget) bool {
+	if target.WebSocketDebuggerURL == "" {
+		return false
+	}
+	dialer := websocket.DefaultDialer
+	conn, _, err := dialer.Dial(target.WebSocketDebuggerURL, nil)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+
+	injected, _ := checkTargetInjectedOnConn(conn)
+	return injected
+}
+
+// InjectTarget 向目标页面注入脚本（兼容包装）
+func InjectTarget(target CDPTarget, overlaySource string, injectedSet map[string]bool, mu *sync.Mutex) error {
+	injected, _, err := EnsureTargetInjected(target, overlaySource)
+	if injected && target.ID != "" && mu != nil {
 		mu.Lock()
 		injectedSet[target.ID] = true
 		mu.Unlock()
 	}
-	return nil
+	return err
 }
 
 // WaitForPort 等待调试端口就绪
@@ -405,9 +446,9 @@ func Watch(cfg AppConfig, overlaySource string, injectedSet map[string]bool, mu 
 		}
 
 		// 同一页面可能同时收到 targetCreated、targetInfoChanged 和主动初检，
-		// 只允许一个注入任务运行，避免多个 CDP 连接在页面导航期间互相竞争。
+		// 只允许一个注入任务运行；若已成功注入则无需重复注入。
 		mu.Lock()
-		if injectionPending[target.ID] {
+		if injectedSet[target.ID] || injectionPending[target.ID] {
 			mu.Unlock()
 			return
 		}
@@ -421,36 +462,32 @@ func Watch(cfg AppConfig, overlaySource string, injectedSet map[string]bool, mu 
 				mu.Unlock()
 			}()
 
-			const maxAttempts = 5
+			const maxAttempts = 3
 			var lastErr error
 			for attempt := 1; attempt <= maxAttempts; attempt++ {
-				// 页面可能在上一次事件后已经完成注入，尤其是导航过程中。
-				if IsTargetInjected(target) {
+				// 单连接复用：一次性完成检查、Page.enable、addScriptToEvaluateOnNewDocument、evaluate 与复核
+				injected, isPermanent, err := EnsureTargetInjected(target, overlaySource)
+				if injected {
 					mu.Lock()
 					injectedSet[target.ID] = true
 					mu.Unlock()
+					title := getTargetTitle(target.Title, rawURL)
+					fmt.Printf("[%s] 捕获到目标页面，成功注入汉化: %s (ID: %s)\n", triggerType, title, target.ID)
 					return
 				}
 
-				if err := InjectTarget(target, overlaySource, injectedSet, mu); err == nil {
-					// Runtime.evaluate 返回成功不代表脚本没有抛 JS 异常；复核标记，
-					// 只有页面真实安装后才报告成功。
-					if IsTargetInjected(target) {
-						title := getTargetTitle(target.Title, rawURL)
-						fmt.Printf("[%s] 捕获到目标页面，成功注入汉化: %s (ID: %s)\n", triggerType, title, target.ID)
-						return
-					}
-					lastErr = fmt.Errorf("注入后页面未确认汉化脚本已安装")
-				} else {
-					lastErr = err
+				// 若目标已被 Electron 销毁（如 Splash 首屏页面关闭），属于永久性状态，直接终止重试
+				if isPermanent {
+					return
 				}
 
+				lastErr = err
 				if attempt < maxAttempts {
-					time.Sleep(time.Duration(attempt) * 250 * time.Millisecond)
+					time.Sleep(time.Duration(attempt) * 200 * time.Millisecond)
 				}
 			}
 			if lastErr != nil {
-				fmt.Printf("[警告] 页面注入失败（已重试 %d 次，后续页面事件将再次尝试）: %v (ID: %s)\n", maxAttempts, lastErr, target.ID)
+				fmt.Printf("[警告] 页面注入失败（已重试 %d 次，后续页面事件或后台巡检将自动补刀）: %v (ID: %s)\n", maxAttempts, lastErr, target.ID)
 			}
 		}()
 	}
@@ -460,6 +497,49 @@ func Watch(cfg AppConfig, overlaySource string, injectedSet map[string]bool, mu 
 	for _, it := range initialTargets {
 		injectIfMatch(it, it.URL, "主动初检")
 	}
+
+	// 启动后台 Watchdog 巡检器（彻底解决启动瞬间竞态、偶发残留英文版、页面重新导航问题）
+	stopWatchdog := make(chan struct{})
+	defer close(stopWatchdog)
+
+	go func() {
+		ticker := time.NewTicker(2000 * time.Millisecond)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-stopWatchdog:
+				return
+			case <-ticker.C:
+				targets := CheckPort(cfg.Port)
+				for _, t := range targets {
+					if !isTargetPage(t.URL, cfg.Name) {
+						continue
+					}
+
+					mu.Lock()
+					alreadyInjected := injectedSet[t.ID]
+					isPending := injectionPending[t.ID]
+					mu.Unlock()
+
+					// 兜底自愈：若发现符合条件的存活页面尚未注入且未在注入队列中，立即自动补刀
+					if !alreadyInjected && !isPending {
+						injectIfMatch(t, t.URL, "巡检自愈")
+					} else if alreadyInjected && !isPending {
+						// 复核已注入页面：若用户刷新导致文档重置（__observedDocument 失效），重新补刀
+						go func(target CDPTarget) {
+							if !IsTargetInjected(target) {
+								mu.Lock()
+								delete(injectedSet, target.ID)
+								mu.Unlock()
+								injectIfMatch(target, target.URL, "巡检自愈")
+							}
+						}(t)
+					}
+				}
+			}
+		}
+	}()
 
 	// 事件监听
 	type TargetInfo struct {
@@ -471,6 +551,7 @@ func Watch(cfg AppConfig, overlaySource string, injectedSet map[string]bool, mu 
 	type CDPNotification struct {
 		Method string `json:"method"`
 		Params struct {
+			TargetID   string     `json:"targetId"`
 			TargetInfo TargetInfo `json:"targetInfo"`
 		} `json:"params"`
 	}
@@ -497,6 +578,18 @@ func Watch(cfg AppConfig, overlaySource string, injectedSet map[string]bool, mu 
 
 		var notif CDPNotification
 		if err := json.Unmarshal(msg, &notif); err != nil {
+			continue
+		}
+
+		// 监听目标销毁（如 Splash 页面关闭），及时清理状态
+		if notif.Method == "Target.targetDestroyed" {
+			targetID := notif.Params.TargetID
+			if targetID != "" {
+				mu.Lock()
+				delete(injectedSet, targetID)
+				delete(injectionPending, targetID)
+				mu.Unlock()
+			}
 			continue
 		}
 
